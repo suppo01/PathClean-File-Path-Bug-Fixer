@@ -1,12 +1,36 @@
 # ------ Import Block -------
 import ast
-import subprocess
-import sys
 import os
 import re
-
 from typing import Any
+
 # ----------------------------
+
+
+# ----- Custom Exception Block -----
+class PathsNotFound(Exception):
+    """Custom exception for paths not being found by regex when expected."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+# ----- Path Location with Regex -----
+def extract_paths_from_code_line(line: int) -> list[str]:
+    """Extracts potential paths from Python code using regex."""
+    # Regex pattern to match Windows paths (e.g., C:\folder\file.txt)
+    file_paths_list = []
+    path_pattern_drive_letter = r"[A-Za-z]:[\/\\][\w\-.\\\/]+"
+    file_paths_list.append(re.findall(path_pattern_drive_letter, line))
+    path_pattern_raw_string_drive_letter = r"r?[\"']([A-Za-z]:[\/\\][\w\-.\\\/]+)[\"']"
+    file_paths_list.append(re.findall(path_pattern_raw_string_drive_letter, line))
+    path_pattern_sub_folder = r"[\"']((?:\.\.?\/)*[\w\-.\/\\]+)[\"']"
+    file_paths_list.append(re.findall(path_pattern_sub_folder, line))
+    path_pattern__raw_string_sub_folder = r"r?[\"']((?:\.\.?\/)*[\w\-.\/\\]+)[\"']"
+    file_paths_list.append(re.findall(path_pattern__raw_string_sub_folder, line))
+    return file_paths_list
+
+# ------------------------------------
 
 
 # ----- Symbolic Path Analysis with Z3 -----
@@ -95,8 +119,7 @@ def check_with_z3(code: str) -> list[str]:
             # Track input() assignments
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        if isinstance(node.value, ast.Call):
+                    if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
                             func = get_func_name(node.value.func)
                             if func == "input":
                                 user_inputs[target.id] = True
@@ -104,32 +127,27 @@ def check_with_z3(code: str) -> list[str]:
             # Track sys.argv usage
             if isinstance(node, ast.Call):
                 func = get_func_name(node.func)
-                if func == "__getitem__" and isinstance(node.func, ast.Attribute):
-                    if isinstance(node.func.value, ast.Attribute):
-                        if (
-                            isinstance(node.func.value.value, ast.Name)
-                            and node.func.value.value.id == "sys"
-                            and node.func.value.attr == "argv"
-                        ):
-                            # sys.argv used - check if it's in a path operation
-                            parent_call = node
-                            for parent in ast.walk(tree):
-                                if isinstance(parent, ast.Call):
-                                    for arg in parent.args:
-                                        if arg == node:
-                                            path_func = get_func_name(parent.func)
-                                            if path_func in (
-                                                "listdir",
-                                                "chdir",
-                                                "open",
-                                                "exists",
-                                                "isdir",
-                                                "isfile",
-                                                "walk",
-                                            ):
-                                                errors.append(
-                                                    f"Line {parent.lineno}: sys.argv used in path operation"
-                                                )
+                if func == "__getitem__" and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute) and (
+                    isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == "sys" and node.func.value.attr == "argv"):
+                    # sys.argv used - check if it's in a path operation
+                    parent_call = node
+                    for parent in ast.walk(tree):
+                        if isinstance(parent, ast.Call):
+                            for arg in parent.args:
+                                if arg == node:
+                                    path_func = get_func_name(parent.func)
+                                    if path_func in (
+                                        "listdir",
+                                        "chdir",
+                                        "open",
+                                        "exists",
+                                        "isdir",
+                                        "isfile",
+                                        "walk",
+                                        ):
+                                            errors.append(
+                                                f"Line {parent.lineno}: sys.argv used in path operation"
+                                            )
 
             # Check path operations that use user input
             if isinstance(node, ast.Call):
@@ -144,9 +162,7 @@ def check_with_z3(code: str) -> list[str]:
                     "walk",
                 ):
                     for arg in node.args:
-                        if uses_user_input(arg):
-                            check_path_dangers(arg, node.lineno)
-                        elif looks_like_path(arg):
+                        if uses_user_input(arg) or looks_like_path(arg):
                             check_path_dangers(arg, node.lineno)
 
         return errors
@@ -168,8 +184,7 @@ def check_path_concatenation(code: str) -> list[str]:
             continue
 
         # Check for input() + path operations in same line
-        if "input(" in line:
-            if any(
+        if "input(" in line and any(
                 x in line
                 for x in [
                     "+",
@@ -184,8 +199,7 @@ def check_path_concatenation(code: str) -> list[str]:
                 errors.append(f"Line {lineno}: input() with path concatenation")
 
         # Check for f-strings building paths with variables
-        if ('f"' in line or "f'" in line) and "{" in line:
-            if any(x in line for x in ["\\\\", "os.path", ":\\\\", ":///"]):
+        if ('f"' in line or "f'" in line) and "{" in line and any(x in line for x in ["\\\\", "os.path", ":\\\\", ":///"]):
                 errors.append(f"Line {lineno}: f-string builds path with variable")
 
         # Check for os.path.join with user input
@@ -213,11 +227,10 @@ class DynamicPathAnalyzer(ast.NodeVisitor):
                             f"Line {node.lineno}: Variable '{target.id}' receives user input"
                         )
 
-        if isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.Add):
-            if self._contains_user_input(node.value):
-                self.errors.append(
-                    f"Line {node.lineno}: Path built from concatenation with user input"
-                )
+        if isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.Add) and self._contains_user_input(node.value):
+            self.errors.append(
+                f"Line {node.lineno}: Path built from concatenation with user input"
+            )
 
         if isinstance(node.value, ast.JoinedStr):
             has_path = any(
@@ -298,7 +311,6 @@ class DynamicPathAnalyzer(ast.NodeVisitor):
     def _looks_like_path(self, s: str) -> bool:
         if not s or not isinstance(s, str):
             return False
-        import re
 
         return bool(
             re.search(r"^[A-Za-z]:[/\\]", s)
@@ -348,15 +360,13 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self._check(folder, node.lineno)
 
         # Detects Path("folder").iterdir()
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "iterdir":
-            if isinstance(node.func.value, ast.Call):
-                if (
-                    isinstance(node.func.value.func, ast.Name)
-                    and node.func.value.func.id == "Path"
-                ):
-                    folder = self._extract_string(node.func.value.args[0])
-                    if folder:
-                        self._check(folder, node.lineno)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "iterdir" and isinstance(node.func.value, ast.Call) and (
+            isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "Path"
+            ):
+                folder = self._extract_string(node.func.value.args[0])
+                if folder:
+                    self._check(folder, node.lineno)
 
         # Detects print("path") - extracts any string arguments that look like paths
         if isinstance(node.func, ast.Name) and node.func.id == "print":
@@ -493,7 +503,7 @@ def validate_windows_path(path: str, root: str = "") -> list[str]:
     return analyzer.errors
 
 
-def analyze_folder_access(input_path: str, root: str = "") -> None:
+def analyze_folder_access(input_path: str, root: str = "") -> list[str]:
     """Runs static analysis on either Python code or a path command for possible Windows pathing errors."""
     # Assigns input_path to a function specific variable user_input
     user_input = input_path
@@ -507,34 +517,28 @@ def analyze_folder_access(input_path: str, root: str = "") -> None:
         # Creates an instance of the FileSystem_Analyzer class and visits the AST of the code
         analyzer = FileSystem_Analyzer(root)
 
-        # Trys to parse as AST first, if fails fall back to string analysis
+        # Trys to do line-by-line string analysis for path extraction first, and falls back to AST if no paths are found
         try:
-            analyzer.visit(ast.parse(code))
-        except SyntaxError:
-            # Falls back to line-by-line string analysis for path extraction
             lines = code.split("\n")
             for line_num, line in enumerate(lines, 1):
                 # Finds all string literals in this line
-                strings = re.findall(r'"([^"]*)"', line) + re.findall(
-                    r"'([^']*)'", line
-                )
-                for string_literal in strings:
+                paths = extract_paths_from_code_line(line)
+                for string_literal in paths:
                     if string_literal:  # Only check non-empty strings
                         analyzer._check(string_literal, lineno=line_num)
+            if paths is None:
+                raise PathsNotFound("No paths found in code using regex.")
+        except PathsNotFound:
+            # Falls back to parsing as AST if needed
+            analyzer.visit(ast.parse(code))
 
         # Run symbolic/dynamic path analysis
         print("\nRunning dynamic path analysis...")
         dynamic_errors = analyze_dynamic_paths(code)
         all_errors = analyzer.errors + dynamic_errors
 
-        # If the analyzer, an instance of the FileSystem_Analyzer class, has any errors, they are printed out
-        if all_errors:
-            print("\nIssues found:")
-            for err in all_errors:
-                print(" -", err)
-        else:
-            print("No folder path issues detected.")
-        return
+        # Return all errors as a list
+        return all_errors
 
     # 2. Otherwise → treats input as a path command and focuses on validating the path
     # The path is extracted from the command input
@@ -542,13 +546,8 @@ def analyze_folder_access(input_path: str, root: str = "") -> None:
     # The path is validated using the validate_windows_path function and errors are collected in the errors variable
     errors = validate_windows_path(path, root)
 
-    # If any errors were found during validation, they are printed out
-    if errors:
-        print("\nIssues found:")
-        for err in errors:
-            print(" -", err)
-    else:
-        print("No path issues detected.")
+    # Return the list of errors found in the path command
+    return errors
 
 
 # ----------------------------

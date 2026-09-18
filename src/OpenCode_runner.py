@@ -1,8 +1,9 @@
-import os
-import asyncio
-import re
 import ast
-from detect import extract_path_from_command
+import asyncio
+import os
+import re
+
+from detect_static_analysis import extract_path_from_command
 from typing import Any
 
 
@@ -119,8 +120,6 @@ async def run_opencode_acp(
 
 def run_opencode_prompt_sync(
     broken_code: str,
-    potential_bug: str,
-    analysis_results: str = "",
     model: str = "opencode/minimax-m2.5-free",
 ) -> Any:
     """Run OpenCode via ACP with iterative querying and few-shot approach."""
@@ -130,35 +129,30 @@ def run_opencode_prompt_sync(
     else:
         broken_code_content = extract_path_from_command(broken_code)
 
-    analysis_section = ""
-    if analysis_results:
-        analysis_section = f"""ANALYSIS RESULTS:
-{analysis_results}
 
-"""
+    """
 
     # Prompt that instructs OpenCode to do iterative refinement internally
-    prompt = f"""Fix Windows path bugs in this code. Use iterative refinement to improve the fix.
+    prompt = f"Fix Windows path bugs in this code. Use iterative refinement to improve the fix.
 
-{analysis_section}{FEW_SHOT_EXAMPLES}
+    {analysis_section}{FEW_SHOT_EXAMPLES}
 
-CODE TO FIX:
-{broken_code_content}
+    CODE TO FIX:
+    {broken_code_content}
+    TASK:
+    1. First, identify all Windows path bugs in the code
+    2. Generate an initial fix
+    3. Review the fix and refine it if needed (up to 3 refinement iterations)
+    4. Return the FINAL corrected code and an explanation of the changes made
 
-TASK:
-1. First, identify all Windows path bugs in the code
-2. Generate an initial fix
-3. Review the fix and refine it if needed (up to 3 refinement iterations)
-4. Return the FINAL corrected code and an explanation of the changes made
+    REQUIREMENTS:
+    - Return the final corrected Python code and an explanation of the changes made
+    - Use raw strings (r"...") for paths with backslashes
+    - Avoid reserved Windows names: COM1, COM2, LPT1, LPT2, LPT3, PRN, AUX, CON, NUL
+    - Paths must start with drive letter (C:) and not be UNC paths
 
-REQUIREMENTS:
-- Return the final corrected Python code and an explanation of the changes made
-- Use raw strings (r"...") for paths with backslashes
-- Avoid reserved Windows names: COM1, COM2, LPT1, LPT2, LPT3, PRN, AUX, CON, NUL
-- Paths must start with drive letter (C:) and not be UNC paths
-
-FINAL CODE:
-"""
+    FINAL CODE:
+    """
 
     print(f"Running OpenCode via ACP with iterative querying...")
 
@@ -185,4 +179,4 @@ def run_opencode_prompt(
     model: str = "opencode/minimax-m2.5-free",
 ) -> Any:
     """Synchronous wrapper."""
-    return run_opencode_prompt_sync(broken_code, potential_bug, analysis_results, model)
+    return run_opencode_prompt_sync(broken_code, model)
