@@ -16,7 +16,7 @@ class PathsNotFound(Exception):
 
 
 # ----- Path Location with Regex -----
-def extract_paths_from_code_line(line: int) -> list[str]:
+def extract_paths_from_code_line(line: str) -> list[str]:
     """Extracts potential paths from Python code using regex."""
     # Regex pattern to match Windows paths (e.g., C:\folder\file.txt)
     file_paths_list = []
