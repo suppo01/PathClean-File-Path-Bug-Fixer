@@ -1,4 +1,4 @@
-# WinClean: A python Data Cleaning Engine for Windows
+# PathClean: A Bug Fixer for File Paths
 
 WinClean is a Python based Data Cleaning Engine for Windows with a focus on Windows file path command errors.
 
