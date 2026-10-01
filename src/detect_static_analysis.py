@@ -2,6 +2,7 @@
 import ast
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 # ----------------------------
@@ -404,7 +405,6 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self.errors.append(
                     f"Line {lineno}: UNC path '{raw}' cannot be used as a current directory in Windows CMD"
                 )
-            return
 
         # Detects illegal characters using a set containing all illegal characters
         illegal_chars = set('<>"|?*')
@@ -416,7 +416,6 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self.errors.append(
                     f"Line {lineno}: Path '{raw}' contains illegal Windows characters"
                 )
-            return
 
         # Detects mixed slashes using a functionality of strings
         if "/" in folder and "\\" in folder:
@@ -425,7 +424,6 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self.errors.append(f"Path '{raw}' mixes slash styles")
             else:
                 self.errors.append(f"Line {lineno}: Path '{raw}' mixes slash styles")
-            return
 
         # Detects missing drive letter using a string function
         # For Python file analysis (lineno > 0), always require drive letters
@@ -443,7 +441,6 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self.errors.append(
                     f"Line {lineno}: Path '{raw}' is missing a drive letter"
                 )
-            return
 
         # Detects reserved names using a dictionary containing all reserved device names
         reserved = {
@@ -465,13 +462,12 @@ class FileSystem_Analyzer(ast.NodeVisitor):
                 self.errors.append(
                     f"Line {lineno}: Path '{raw}' uses reserved Windows device name '{base}'"
                 )
-            return
 
         # Resolves the path using os package
-        full = os.path.abspath(os.path.join(self.root, folder))
+        full = Path(os.path.abspath(os.path.join(self.root, folder)))
 
         # Does an existence check using os
-        if not os.path.isdir(full):
+        if not full.exists():
             # This is used for path commands being checked as the fake line number being employed is 0
             if lineno == 0:
                 self.errors.append(f"Folder does not exist -> {full}")
