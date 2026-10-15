@@ -18,18 +18,22 @@ class PathsNotFound(Exception):
 
 # ----- Path Location with Regex -----
 def extract_paths_from_code_line(line: str) -> list[str]:
-    """Extracts potential paths from Python code using regex."""
-    # Regex pattern to match Windows paths (e.g., C:\folder\file.txt)
-    file_paths_list = []
+    matches = []
+
     path_pattern_drive_letter = r"[A-Za-z]:[\/\\][\w\-.\\\/]+"
-    file_paths_list.append(re.findall(path_pattern_drive_letter, line))
     path_pattern_raw_string_drive_letter = r"r?[\"']([A-Za-z]:[\/\\][\w\-.\\\/]+)[\"']"
-    file_paths_list.append(re.findall(path_pattern_raw_string_drive_letter, line))
     path_pattern_sub_folder = r"[\"']((?:\.\.?\/)*[\w\-.\/\\]+)[\"']"
-    file_paths_list.append(re.findall(path_pattern_sub_folder, line))
     path_pattern__raw_string_sub_folder = r"r?[\"']((?:\.\.?\/)*[\w\-.\/\\]+)[\"']"
-    file_paths_list.append(re.findall(path_pattern__raw_string_sub_folder, line))
-    return file_paths_list
+
+    for pattern in (
+        path_pattern_drive_letter,
+        path_pattern_raw_string_drive_letter,
+        path_pattern_sub_folder,
+        path_pattern__raw_string_sub_folder,
+    ):
+        matches.extend(re.findall(pattern, line))
+
+    return matches
 
 # ------------------------------------
 
@@ -38,56 +42,149 @@ def extract_paths_from_code_line(line: str) -> list[str]:
 def check_with_z3(code: str) -> list[str]:
     """Check code using Z3 symbolic path analysis - only path-related issues."""
     try:
-        from z3 import Solver, String, Contains, StringVal, Or, sat
+        from z3 import (
+        Solver,
+        String,
+        StringVal,
+        Contains,
+        Concat,
+        Or,
+        sat,
+        )
 
         tree = ast.parse(code)
-        user_inputs = {}  # var_name -> True (tracks that this var gets user input)
+
+        user_inputs = {}
+        z3_vars = {}
         errors = []
+
 
         def get_func_name(node):
             if isinstance(node, ast.Name):
                 return node.id
+
             if isinstance(node, ast.Attribute):
                 if isinstance(node.value, ast.Name):
                     return f"{node.value.id}.{node.attr}"
                 return node.attr
+
             return ""
 
+
+        def ast_to_z3(node):
+            """
+            Convert AST expression to Z3 string expression.
+            """
+
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, str):
+                    return StringVal(node.value)
+
+            elif isinstance(node, ast.Name):
+                if node.id not in z3_vars:
+                    z3_vars[node.id] = String(node.id)
+
+                return z3_vars[node.id]
+
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = ast_to_z3(node.left)
+                right = ast_to_z3(node.right)
+
+                if left is not None and right is not None:
+                    return Concat(left, right)
+
+            elif isinstance(node, ast.JoinedStr):
+                parts = []
+
+                for value in node.values:
+
+                    if isinstance(value, ast.Constant):
+                        parts.append(StringVal(str(value.value)))
+
+                    elif isinstance(value, ast.FormattedValue):
+
+                        if isinstance(value.value, ast.Name):
+                            name = value.value.id
+
+                            if name not in z3_vars:
+                                z3_vars[name] = String(name)
+
+                            parts.append(z3_vars[name])
+
+                if parts:
+                    expr = parts[0]
+
+                    for p in parts[1:]:
+                        expr = Concat(expr, p)
+
+                    return expr
+
+            return None
+
+
         def looks_like_path(node):
-            """Check if AST node involves path operations."""
+
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
                 return looks_like_path(node.left) or looks_like_path(node.right)
+
             if isinstance(node, ast.JoinedStr):
                 return any(
-                    (
-                        isinstance(v, ast.Constant)
-                        and isinstance(v.value, str)
-                        and ("/" in v.value or "\\" in v.value or ":" in v.value)
+                    isinstance(v, ast.Constant)
+                    and isinstance(v.value, str)
+                    and (
+                        "/" in v.value
+                        or "\\" in v.value
+                        or ":" in v.value
                     )
                     for v in node.values
                 )
+
             if isinstance(node, ast.Call):
                 func = get_func_name(node.func)
                 return func in ("join", "path.join")
+
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                return "/" in node.value or "\\" in node.value or ":" in node.value
+                return (
+                    "/" in node.value
+                    or "\\" in node.value
+                    or ":" in node.value
+                )
+
             return False
+
 
         def uses_user_input(node):
-            """Check if expression uses any user input variables."""
+
             if isinstance(node, ast.Name):
                 return node.id in user_inputs
+
             if isinstance(node, ast.Attribute):
                 return uses_user_input(node.value)
+
             if isinstance(node, ast.BinOp):
-                return uses_user_input(node.left) or uses_user_input(node.right)
+                return (
+                    uses_user_input(node.left)
+                    or uses_user_input(node.right)
+                )
+
             if isinstance(node, ast.Call):
-                return any(uses_user_input(arg) for arg in node.args)
+                return any(
+                    uses_user_input(arg)
+                    for arg in node.args
+                )
+
             return False
 
-        def check_path_dangers(path_expr, lineno, desc=""):
-            """Check if symbolic path could be dangerous."""
+
+        def check_path_dangers(path_node, lineno):
+
+            z3_path = ast_to_z3(path_node)
+
+            if z3_path is None:
+                return
+
             ILLEGAL = set('<>:"|?*')
+
             RESERVED = {
                 "CON",
                 "PRN",
@@ -98,61 +195,76 @@ def check_with_z3(code: str) -> list[str]:
             }
 
             for char in ILLEGAL:
+
                 solver = Solver()
-                solver.add(Contains(path_expr, StringVal(char)))
+
+                solver.add(
+                    Contains(
+                        z3_path,
+                        StringVal(char),
+                    )
+            )
+
                 if solver.check() == sat:
-                    errors.append(f"Line {lineno}: Path MAY contain illegal '{char}'")
+
+                    errors.append(
+                        f"Line {lineno}: Path MAY contain illegal '{char}'"
+                    )
 
             for name in RESERVED:
+
                 solver = Solver()
+
                 solver.add(
                     Or(
-                        Contains(path_expr, StringVal(f"/{name}")),
-                        Contains(path_expr, StringVal(f"\\{name}")),
-                        Contains(path_expr, StringVal(f":\\{name}")),
+                        Contains(
+                            z3_path,
+                    StringVal(f"/{name}")
+                    ),
+                        Contains(
+                            z3_path,
+                            StringVal(f"\\{name}")
+                        ),
+                        Contains(
+                            z3_path,
+                            StringVal(f":\\{name}")
+                        ),
                     )
                 )
+
                 if solver.check() == sat:
-                    errors.append(f"Line {lineno}: Path MAY contain reserved '{name}'")
+
+                    errors.append(
+                        f"Line {lineno}: Path MAY contain reserved '{name}'"
+                    )
+
 
         # Visit all nodes
         for node in ast.walk(tree):
-            # Track input() assignments
+
             if isinstance(node, ast.Assign):
+
                 for target in node.targets:
-                    if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
-                            func = get_func_name(node.value.func)
-                            if func == "input":
-                                user_inputs[target.id] = True
 
-            # Track sys.argv usage
-            if isinstance(node, ast.Call):
-                func = get_func_name(node.func)
-                if func == "__getitem__" and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute) and (
-                    isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == "sys" and node.func.value.attr == "argv"):
-                    # sys.argv used - check if it's in a path operation
-                    parent_call = node
-                    for parent in ast.walk(tree):
-                        if isinstance(parent, ast.Call):
-                            for arg in parent.args:
-                                if arg == node:
-                                    path_func = get_func_name(parent.func)
-                                    if path_func in (
-                                        "listdir",
-                                        "chdir",
-                                        "open",
-                                        "exists",
-                                        "isdir",
-                                        "isfile",
-                                        "walk",
-                                        ):
-                                            errors.append(
-                                                f"Line {parent.lineno}: sys.argv used in path operation"
-                                            )
+                    if (
+                        isinstance(target, ast.Name)
+                        and isinstance(node.value, ast.Call)
+                    ):
 
-            # Check path operations that use user input
+                        func = get_func_name(node.value.func)
+
+                        if func == "input":
+
+                            user_inputs[target.id] = True
+
+                            z3_vars[target.id] = String(
+                                target.id
+                            )
+
             if isinstance(node, ast.Call):
+
                 func = get_func_name(node.func)
+
                 if func in (
                     "listdir",
                     "chdir",
@@ -162,12 +274,20 @@ def check_with_z3(code: str) -> list[str]:
                     "isfile",
                     "walk",
                 ):
+
                     for arg in node.args:
-                        if uses_user_input(arg) or looks_like_path(arg):
-                            check_path_dangers(arg, node.lineno)
+
+                        if (
+                            uses_user_input(arg)
+                            or looks_like_path(arg)
+                        ):
+
+                            check_path_dangers(
+                                arg,
+                                node.lineno,
+                            )
 
         return errors
-
     except ImportError:
         return ["Z3 not installed - run: pip install z3-solver"]
     except SyntaxError:
@@ -251,31 +371,33 @@ class DynamicPathAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node) -> None:
-        func_name = self._get_func_name(node.func)
+        """Visits a node in the code passed in for ast."""
 
-        if func_name in (
-            "listdir",
-            "chdir",
-            "open",
-            "exists",
-            "isdir",
-            "isfile",
-            "walk",
+        # Detects open("file")
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "open":
+                if node.args:
+                    path = self._extract_string(node.args[0])
+                    if path:
+                        self._check(path, node.lineno)
+
+        # Detects os.listdir("folder")
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "listdir":
+            folder = self._extract_string(node.args[0])
+            if folder:
+                self._check(folder, node.lineno)
+
+        # Detects Path("folder").iterdir()
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "iterdir"
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "Path"
         ):
-            for arg in node.args:
-                if self._uses_user_input(arg):
-                    self.errors.append(
-                        f"Line {node.lineno}: Path operation uses user input"
-                    )
-                    break
-
-        if func_name in ("join", "path.join"):
-            for arg in node.args:
-                if self._uses_user_input(arg):
-                    self.errors.append(
-                        f"Line {node.lineno}: os.path.join uses user input"
-                    )
-                    break
+            folder = self._extract_string(node.func.value.args[0])
+            if folder:
+                self._check(folder, node.lineno)
 
         self.generic_visit(node)
 
@@ -319,6 +441,18 @@ class DynamicPathAnalyzer(ast.NodeVisitor):
             or s.startswith("\\")
             or re.search(r"[/\\]{2,}", s)
         )
+
+    def _extract_string(self, node) -> str | None:
+        """Return the literal string value represented by an AST node."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    def _check(self, path: str, lineno: int) -> None:
+        """Run the shared filesystem path checks and retain any diagnostics."""
+        analyzer = FileSystem_Analyzer()
+        analyzer._check(path, lineno)
+        self.errors.extend(analyzer.errors)
 
 
 def check_dynamic_path(code: str) -> list[str]:
@@ -451,16 +585,18 @@ class FileSystem_Analyzer(ast.NodeVisitor):
             *(f"COM{i}" for i in range(1, 10)),
             *(f"LPT{i}" for i in range(1, 10)),
         }
-        base = os.path.basename(folder).upper()
-        if base in reserved:
+        base_name = os.path.splitext(
+            os.path.basename(folder)
+        )[0].upper()
+        if base_name in reserved:
             # This is used for path commands being checked as the fake line number being employed is 0
             if lineno == 0:
                 self.errors.append(
-                    f"Path '{raw}' uses reserved Windows device name '{base}'"
+                    f"Path '{raw}' uses reserved Windows device name '{base_name}'"
                 )
             else:
                 self.errors.append(
-                    f"Line {lineno}: Path '{raw}' uses reserved Windows device name '{base}'"
+                    f"Line {lineno}: Path '{raw}' uses reserved Windows device name '{base_name}'"
                 )
 
         # Resolves the path using os package
@@ -513,23 +649,28 @@ def analyze_folder_access(input_path: str, root: str = "") -> list[str]:
         # Creates an instance of the FileSystem_Analyzer class and visits the AST of the code
         analyzer = FileSystem_Analyzer(root)
 
+        # Initializes found_any boolean variable
+        found_any = False
+
         # Trys to do line-by-line string analysis for path extraction first, and falls back to AST if no paths are found
         try:
             lines = code.split("\n")
             for line_num, line in enumerate(lines, 1):
                 # Finds all string literals in this line
                 paths = extract_paths_from_code_line(line)
+                if paths:
+                    found_any = True
                 for string_literal in paths:
                     if string_literal:  # Only check non-empty strings
                         analyzer._check(string_literal, lineno=line_num)
-            if paths is None:
+            if not found_any:
                 raise PathsNotFound("No paths found in code using regex.")
         except PathsNotFound:
             # Falls back to parsing as AST if needed
             analyzer.visit(ast.parse(code))
 
         # Run symbolic/dynamic path analysis
-        print("\nRunning dynamic path analysis...")
+        print("\nRunning symbolic path analysis...")
         dynamic_errors = analyze_dynamic_paths(code)
         all_errors = analyzer.errors + dynamic_errors
 
